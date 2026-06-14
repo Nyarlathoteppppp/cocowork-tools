@@ -1,0 +1,395 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ABG_OPEN="${ABG_OPEN:-/opt/homebrew/bin/abg-open}"
+DEFAULT_WORKSPACE="${ABG_COWORK_DIR:-/Users/ywbw/cowork}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  abg-upgrade [path] [options]
+
+Path:
+  If omitted, uses $ABG_COWORK_DIR or /Users/ywbw/cowork.
+  If path is a file, uses the file's parent directory.
+
+Options:
+  --check            Check if upgrade is needed (exit 0=current, 1=stale)
+  --dry-run          Preview changes without modifying anything
+  --force            Upgrade even if template versions match
+  -h, --help         Show this help
+
+Examples:
+  abg-upgrade --check
+  abg-upgrade --dry-run
+  abg-upgrade
+  abg-upgrade /path/to/project --dry-run
+EOF
+}
+
+# --- Helpers ---
+
+cowork_resolve_workspace() {
+  local target="$1"
+  if [[ -d "$target" ]]; then
+    printf '%s' "$target"
+  elif [[ -f "$target" ]]; then
+    dirname "$target"
+  elif [[ -d "$(dirname "$target")" ]]; then
+    dirname "$target"
+  else
+    return 1
+  fi
+}
+
+cowork_read_json_field() {
+  local file="$1" key="$2" line val keypat
+  keypat="\"${key}\":"
+  [[ -f "$file" ]] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      *"$keypat"*)
+        val="${line#*$keypat}"
+        while [[ "$val" == [[:space:]]* ]]; do
+          val="${val#[[:space:]]}"
+        done
+        if [[ "$val" == \"* ]]; then
+          val="${val#\"}"
+          val="${val%%\"*}"
+        else
+          val="${val%%,*}"
+          val="${val%%\}*}"
+          while [[ "$val" == *[[:space:]] ]]; do
+            val="${val%[[:space:]]}"
+          done
+        fi
+        val="${val%$'\r'}"
+        [[ -n "$val" ]] && { printf '%s' "$val"; return 0; }
+        ;;
+    esac
+  done < "$file"
+  return 1
+}
+
+cowork_fetch_template() {
+  local role="$1"
+  "$ABG_OPEN" --dump-template "$role" 2>/dev/null || {
+    echo "abg-upgrade: failed to fetch $role template — is $ABG_OPEN working?" >&2
+    return 1
+  }
+}
+
+cowork_fetch_version() {
+  local field="$1"
+  "$ABG_OPEN" --dump-version "$field" 2>/dev/null || {
+    echo "abg-upgrade: failed to fetch version $field" >&2
+    return 1
+  }
+}
+
+# --- Core functions ---
+
+abg_upgrade_check() {
+  local workspace="$1" fw_file tv fw fv
+  fw_file="$workspace/.agentbridge/framework.json"
+
+  if [[ ! -f "$fw_file" ]]; then
+    echo "Project not cowork-enabled (no .agentbridge/framework.json)"
+    echo "Run \`abg-open $workspace --dry-run\` to set up cowork framework first."
+    return 3
+  fi
+
+  tv="$(cowork_read_json_field "$fw_file" "template_version" 2>/dev/null)" || tv=""
+  fv="$(cowork_read_json_field "$fw_file" "framework_version" 2>/dev/null)" || fv=""
+
+  local current_tv current_fv
+  current_tv="$(cowork_fetch_version template)" || current_tv="unknown"
+  current_fv="$(cowork_fetch_version framework)" || current_fv="unknown"
+
+  echo "Project:      $workspace"
+  echo "Framework:    ${fv:-unknown} → $current_fv"
+  echo "Template:     ${tv:-unknown} → $current_tv"
+
+  if [[ "$tv" == "$current_tv" && "$fv" == "$current_fv" ]]; then
+    echo "Status: current"
+    return 0
+  else
+    echo "Status: upgrade available"
+    (( ! dry_run )) && echo "Run \`abg-upgrade $workspace\` to upgrade."
+    return 1
+  fi
+}
+
+abg_upgrade_dry_run() {
+  local workspace="$1"
+  shift
+  dry_run=1
+  local rc=0
+  abg_upgrade_check "$workspace" || rc=$?
+  (( rc == 3 )) && return 3
+  (( rc == 0 )) && return 0
+
+  echo ""
+  echo "Would upgrade:"
+  local docs=(CLAUDE.md AGENTS.md)
+  local d start_marker end_marker start_count end_count start_line end_line line line_num
+  for d in "${docs[@]}"; do
+    if [[ -f "$workspace/$d" ]]; then
+      start_marker='<!-- AgentBridge:start -->'
+      end_marker='<!-- AgentBridge:end -->'
+      start_count=0; end_count=0; start_line=0; end_line=0; line_num=0
+      while IFS= read -r line; do
+        ((++line_num))
+        case "$line" in
+          *"$start_marker"*) ((++start_count)); start_line=$line_num ;;
+          *"$end_marker"*) ((++end_count)); end_line=$line_num ;;
+        esac
+      done < "$workspace/$d"
+      if (( start_count == 1 && end_count == 1 && start_line < end_line )); then
+        echo "  replace block in $d"
+      else
+        echo "  skip $d (invalid managed block: starts=$start_count, ends=$end_count)"
+      fi
+    else
+      echo "  skip $d (not found)"
+    fi
+  done
+
+  echo ""
+  local backup_dir="$workspace/.agentbridge/backups"
+  echo "Backup:       $backup_dir/"
+  echo "Metadata:     $workspace/.agentbridge/framework.json"
+  return 0
+}
+
+abg_upgrade_docs() {
+  local workspace="$1" rc=0
+  local start_marker='<!-- AgentBridge:start -->'
+  local end_marker='<!-- AgentBridge:end -->'
+  local roles
+  roles=(claude:CLAUDE.md codex:AGENTS.md)
+
+  local entry role file content
+  local start_line end_line line_num line start_count end_count
+  local backup_dir backup_file before after new_body tmp
+  for entry in "${roles[@]}"; do
+    role="${entry%%:*}"
+    file="$workspace/${entry##*:}"
+    content=
+    start_line=0; end_line=0; line_num=0; start_count=0; end_count=0
+    backup_dir= backup_file= before= after= new_body= tmp=
+
+    if [[ ! -f "$file" ]]; then
+      echo "  skip $file (not found)" >&2
+      rc=1
+      continue
+    fi
+
+    content="$(<"$file")" || { echo "  skip $file (unreadable)"; continue; }
+
+    # Validate markers: exactly one start, one end, end after start
+    while IFS= read -r line; do
+      ((++line_num))
+      case "$line" in
+        *"$start_marker"*)
+          ((++start_count))
+          start_line=$line_num
+          ;;
+        *"$end_marker"*)
+          ((++end_count))
+          end_line=$line_num
+          ;;
+      esac
+    done <<< "$content"
+
+    if (( start_count != 1 || end_count != 1 )); then
+      echo "  skip $file (invalid markers: starts=$start_count, ends=$end_count)" >&2
+      rc=1
+      continue
+    fi
+
+    if (( start_line >= end_line )); then
+      echo "  skip $file (end marker before start marker)" >&2
+      rc=1
+      continue
+    fi
+
+    # Backup
+    backup_dir="$workspace/.agentbridge/backups"
+    mkdir -p "$backup_dir"
+    backup_file="$backup_dir/${file##*/}.$(date '+%Y%m%d-%H%M%S')"
+    if [[ -f "$backup_file" ]]; then
+      backup_file="${backup_file}.$$"
+    fi
+    cp -p "$file" "$backup_file" || { echo "  skip $file (backup failed)" >&2; rc=1; continue; }
+    echo "  backed up to $backup_file"
+
+    # Build new content: before start marker + start + new body + end + after end marker
+    before="$(printf '%s\n' "${content%%$start_marker*}")"
+    after="${content#*$end_marker}"
+
+    new_body="$(cowork_fetch_template "$role")" || { echo "  skip $file (template fetch failed)" >&2; rc=1; continue; }
+
+    # Atomic write
+    tmp="$file.tmp.$$"
+    {
+      printf '%s' "$before"
+      printf '%s\n' "$start_marker"
+      printf '%s' "$new_body"
+      printf '\n%s\n' "$end_marker"
+      printf '%s' "$after"
+    } > "$tmp" || { echo "  skip $file (write failed)" >&2; rm -f "$tmp"; rc=1; continue; }
+
+    if ! mv "$tmp" "$file"; then
+      echo "  skip $file (atomic replace failed)" >&2
+      rm -f "$tmp"
+      rc=1
+      continue
+    fi
+    echo "  upgraded $file"
+  done
+
+  return $rc
+}
+
+abg_upgrade_metadata() {
+  local workspace="$1" now
+  now="$(date '+%Y-%m-%dT%H:%M:%S%z')" || now="unknown"
+
+  local fw_file="$workspace/.agentbridge/framework.json"
+  local installed_at
+  if [[ -f "$fw_file" ]]; then
+    installed_at="$(cowork_read_json_field "$fw_file" "installed_at" 2>/dev/null)" || installed_at="$now"
+  else
+    installed_at="$now"
+  fi
+
+  local current_fv current_tv current_msv
+  current_fv="$(cowork_fetch_version framework)" || current_fv="1.0.0"
+  current_tv="$(cowork_fetch_version template)" || current_tv="1.0.0"
+  current_msv="$(cowork_fetch_version memory-schema)" || current_msv="1"
+
+  local tmp="$fw_file.tmp.$$"
+  {
+    printf '{\n'
+    printf '  "framework": "agentbridge-cowork",\n'
+    printf '  "framework_version": "%s",\n' "$current_fv"
+    printf '  "template_version": "%s",\n' "$current_tv"
+    printf '  "memory_schema_version": %s,\n' "$current_msv"
+    printf '  "installed_at": "%s",\n' "$installed_at"
+    printf '  "last_upgraded_at": "%s"\n' "$now"
+    printf '}\n'
+  } > "$tmp"
+
+  mv "$tmp" "$fw_file"
+
+  echo "  updated framework metadata"
+}
+
+# --- Main ---
+
+check_only=0
+dry_run=0
+force=0
+target=""
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --check)
+      check_only=1
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --force)
+      force=1
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "abg-upgrade: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n "$target" ]]; then
+        echo "abg-upgrade: only one path argument is supported" >&2
+        exit 2
+      fi
+      target="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$target" ]]; then
+  target="$DEFAULT_WORKSPACE"
+fi
+
+workspace="$(cowork_resolve_workspace "$target")" || {
+  echo "abg-upgrade: path does not exist: $target" >&2
+  exit 2
+}
+workspace="$(cd "$workspace" && pwd -P)" || {
+  echo "abg-upgrade: cannot resolve workspace: $target" >&2
+  exit 2
+}
+
+if (( check_only )); then
+  abg_upgrade_check "$workspace"
+  exit $?
+fi
+
+if (( dry_run )); then
+  abg_upgrade_dry_run "$workspace"
+  exit $?
+fi
+
+# Full upgrade
+echo "[abg-upgrade] Upgrading $workspace"
+
+# Check current state
+fw_file="$workspace/.agentbridge/framework.json"
+if [[ ! -f "$fw_file" ]]; then
+  echo "Project not cowork-enabled (no .agentbridge/framework.json)"
+  echo "Run \`abg-open $workspace --dry-run\` first."
+  exit 3
+fi
+
+tv="$(cowork_read_json_field "$fw_file" "template_version" 2>/dev/null)" || tv=""
+fv="$(cowork_read_json_field "$fw_file" "framework_version" 2>/dev/null)" || fv=""
+msv="$(cowork_read_json_field "$fw_file" "memory_schema_version" 2>/dev/null)" || msv=""
+current_tv="$(cowork_fetch_version template)" || current_tv=""
+current_fv="$(cowork_fetch_version framework)" || current_fv=""
+current_msv="$(cowork_fetch_version memory-schema)" || current_msv=""
+
+if (( ! force )) && [[ "$tv" == "$current_tv" && "$fv" == "$current_fv" && "$msv" == "$current_msv" ]]; then
+  echo "Already current (framework=$fv, template=$tv, memory_schema=$msv). Use --force to rewrite anyway."
+  exit 0
+fi
+
+echo "  framework: ${fv:-none} → ${current_fv:-unknown}"
+echo "  template: ${tv:-none} → ${current_tv:-unknown}"
+echo "  memory schema: ${msv:-none} → ${current_msv:-unknown}"
+
+# Upgrade docs
+if ! abg_upgrade_docs "$workspace"; then
+  echo "Warning: some docs failed to upgrade; metadata not updated" >&2
+  echo "Re-run with --dry-run to preview, or fix markers manually" >&2
+  exit 1
+fi
+
+# Update metadata
+abg_upgrade_metadata "$workspace"
+
+echo "[abg-upgrade] Upgrade complete"
+exit 0

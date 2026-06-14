@@ -1,0 +1,262 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+DEFAULT_WORKSPACE="${ABG_COWORK_DIR:-/Users/ywbw/cowork}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  abg-remember <title> [options]
+
+Args:
+  title                 Entry title (required, first positional argument)
+
+Options:
+  --type TYPE           decision|gotcha|convention|verification|handoff|note (default: note)
+  --priority PRIO       critical|high|normal|low (default: normal)
+  --visibility VIS      shared|claude|codex (default: shared)
+  --agent AGENT         claude|codex|user|shared (default: matches visibility)
+  --summary TEXT        One-line summary (default: title)
+  --details TEXT        Longer description (default: title)
+  --tags LIST           Comma-separated tags (default: [])
+  --workspace PATH      Target project path (default: current dir or $ABG_COWORK_DIR)
+  -h, --help            Show this help
+
+Examples:
+  abg-remember "Do not schedule current-minute cron" --type gotcha --priority critical
+  abg-remember "Use SQLite" --type decision --priority high --tags "db, performance"
+EOF
+}
+
+# --- Helpers ---
+
+type_plural() {
+  case "$1" in
+    decision) echo decisions ;; gotcha) echo gotchas ;;
+    convention) echo conventions ;; verification) echo verifications ;;
+    handoff) echo handoffs ;; note) echo notes ;;
+    *) echo "$1s" ;;
+  esac
+}
+
+valid_type() {
+  case "$1" in decision|gotcha|convention|verification|handoff|note) return 0 ;; *) return 1 ;; esac
+}
+
+valid_priority() {
+  case "$1" in critical|high|normal|low) return 0 ;; *) return 1 ;; esac
+}
+
+valid_visibility() {
+  case "$1" in shared|claude|codex) return 0 ;; *) return 1 ;; esac
+}
+
+valid_agent() {
+  case "$1" in claude|codex|user|shared) return 0 ;; *) return 1 ;; esac
+}
+
+make_slug() {
+  local s="$1"
+  s="${s:l}"                                    # lowercase
+  s="${s//[^a-z0-9]/-}"                         # non-alnum to dash
+  while [[ "$s" == *--* ]]; do s="${s//--/-}"; done  # collapse dashes
+  s="${s#-}"; s="${s%-}"                        # trim leading/trailing dash
+  [[ -z "$s" ]] && s="memory-entry"
+  printf '%s' "${s:0:60}"
+}
+
+resolve_workspace() {
+  local explicit="$1"
+  [[ -n "$explicit" ]] && { cd "$explicit" 2>/dev/null && pwd -P; return $?; }
+
+  # current working directory
+  local cwd
+  cwd="$(pwd -P 2>/dev/null)" || cwd=""
+  if [[ -n "$cwd" && -w "$cwd" ]]; then
+    printf '%s' "$cwd"
+    return 0
+  fi
+
+  # fallback to default
+  if [[ -d "$DEFAULT_WORKSPACE" ]]; then
+    cd "$DEFAULT_WORKSPACE" && pwd -P
+    return $?
+  fi
+
+  return 1
+}
+
+# --- Main ---
+
+title=""
+type="note"
+priority="normal"
+visibility="shared"
+agent=""
+summary=""
+details=""
+tags=""
+explicit_workspace=""
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --type)
+      if (( $# < 2 )); then echo "abg-remember: --type requires a value" >&2; exit 2; fi
+      type="$2"; shift 2
+      ;;
+    --priority)
+      if (( $# < 2 )); then echo "abg-remember: --priority requires a value" >&2; exit 2; fi
+      priority="$2"; shift 2
+      ;;
+    --visibility)
+      if (( $# < 2 )); then echo "abg-remember: --visibility requires a value" >&2; exit 2; fi
+      visibility="$2"; shift 2
+      ;;
+    --agent)
+      if (( $# < 2 )); then echo "abg-remember: --agent requires a value" >&2; exit 2; fi
+      agent="$2"; shift 2
+      ;;
+    --summary)
+      if (( $# < 2 )); then echo "abg-remember: --summary requires a value" >&2; exit 2; fi
+      summary="$2"; shift 2
+      ;;
+    --details)
+      if (( $# < 2 )); then echo "abg-remember: --details requires a value" >&2; exit 2; fi
+      details="$2"; shift 2
+      ;;
+    --tags)
+      if (( $# < 2 )); then echo "abg-remember: --tags requires a value" >&2; exit 2; fi
+      tags="$2"; shift 2
+      ;;
+    --workspace)
+      if (( $# < 2 )); then echo "abg-remember: --workspace requires a path" >&2; exit 2; fi
+      explicit_workspace="$2"; shift 2
+      ;;
+    -*)
+      echo "abg-remember: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n "$title" ]]; then
+        echo "abg-remember: only one title argument is supported" >&2
+        exit 2
+      fi
+      title="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$title" ]]; then
+  echo "abg-remember: title is required" >&2
+  usage >&2
+  exit 2
+fi
+
+# Validate
+valid_type "$type" || { echo "abg-remember: invalid type '$type' (expected: decision|gotcha|convention|verification|handoff|note)" >&2; exit 2; }
+valid_priority "$priority" || { echo "abg-remember: invalid priority '$priority' (expected: critical|high|normal|low)" >&2; exit 2; }
+valid_visibility "$visibility" || { echo "abg-remember: invalid visibility '$visibility' (expected: shared|claude|codex)" >&2; exit 2; }
+
+# Default agent based on visibility
+if [[ -z "$agent" ]]; then
+  agent="$visibility"
+fi
+valid_agent "$agent" || { echo "abg-remember: invalid agent '$agent'" >&2; exit 2; }
+
+# Default summary/details to title
+[[ -z "$summary" ]] && summary="$title"
+[[ -z "$details" ]] && details="$title"
+
+# Resolve workspace
+workspace="$(resolve_workspace "$explicit_workspace")" || {
+  echo "abg-remember: cannot resolve workspace" >&2
+  exit 1
+}
+
+# Determine scope
+if [[ "$workspace" == "/Users/ywbw/cowork" ]]; then
+  scope="cowork"
+else
+  scope="project"
+fi
+project_name="${workspace##*/}"
+
+# Target directory
+plural="$(type_plural "$type")"
+target_dir="$workspace/memory/$visibility/$plural"
+mkdir -p "$target_dir"
+
+# Generate filename
+local now_slug
+now_slug="$(date '+%Y%m%d-%H%M%S')"
+slug="$(make_slug "$title")"
+filename="${now_slug}-${agent}-${type}-${slug}.md"
+filepath="$target_dir/$filename"
+
+# Handle duplicate filename
+if [[ -f "$filepath" ]]; then
+  local suffix=1
+  while [[ -f "$target_dir/${now_slug}-${agent}-${type}-${slug}-a${suffix}.md" ]]; do
+    ((suffix++))
+  done
+  filepath="$target_dir/${now_slug}-${agent}-${type}-${slug}-a${suffix}.md"
+fi
+
+# Parse tags
+if [[ -n "$tags" ]]; then
+  # Split by comma, trim spaces, wrap in [a, b, c] format
+  local -a tag_list=()
+  local IFS=',' t
+  for t in ${(s:,:)tags}; do
+    t="${t## }"; t="${t%% }"
+    [[ -n "$t" ]] && tag_list+=("$t")
+  done
+  tags_formatted="[${(j:, :)tag_list}]"
+else
+  tags_formatted="[]"
+fi
+
+now_iso="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+# Write entry
+{
+  printf -- '---\n'
+  printf 'schema_version: 1\n'
+  printf 'id: %s\n' "${filename%.md}"
+  printf 'title: %s\n' "$title"
+  printf 'type: %s\n' "$type"
+  printf 'status: active\n'
+  printf 'priority: %s\n' "$priority"
+  printf 'visibility: %s\n' "$visibility"
+  printf 'scope: %s\n' "$scope"
+  [[ "$scope" == "project" ]] && printf 'project: %s\n' "$project_name"
+  printf 'agent: %s\n' "$agent"
+  printf 'created: %s\n' "$now_iso"
+  printf 'updated: %s\n' "$now_iso"
+  printf 'tags: %s\n' "$tags_formatted"
+  printf 'supersedes: null\n'
+  printf 'related: []\n'
+  printf -- '---\n'
+  printf '\n'
+  printf '# %s\n' "$title"
+  printf '\n'
+  printf '## Summary\n'
+  printf '\n'
+  printf '%s\n' "$summary"
+  printf '\n'
+  printf '## Details\n'
+  printf '\n'
+  printf '%s\n' "$details"
+  printf '\n'
+  printf '## Impact\n'
+  printf '\n'
+  printf '_\n'
+} > "$filepath.tmp.$$" && mv "$filepath.tmp.$$" "$filepath"
+
+echo "Created: $filepath"

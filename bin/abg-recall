@@ -1,0 +1,332 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+DEFAULT_WORKSPACE="${ABG_COWORK_DIR:-/Users/ywbw/cowork}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  abg-recall [search-term] [options]
+
+Search memory entries in the current project.
+
+Options:
+  --type TYPE       Filter by type (decision|gotcha|convention|verification|handoff|note)
+  --priority PRIO   Filter by priority (critical|high|normal|low)
+  --tag TAG         Filter by tag (can be repeated)
+  --agent AGENT     Filter by agent
+  --id ID           Find specific entry by id
+  --limit N         Max results (default: 10)
+  --all             Show all results
+  --include-stale   Include superseded/stale entries (default: active only)
+  --workspace PATH  Target project path (default: current dir or $ABG_COWORK_DIR)
+  -h, --help        Show this help
+
+Examples:
+  abg-recall "cron"
+  abg-recall --type gotcha --priority critical
+  abg-recall --id 20260614-123456-shared-gotcha-test
+  abg-recall --tag agentbridge --limit 5
+EOF
+}
+
+# --- Helpers ---
+
+resolve_workspace() {
+  local explicit="$1"
+  [[ -n "$explicit" ]] && { cd "$explicit" 2>/dev/null && pwd -P; return $?; }
+  local cwd
+  cwd="$(pwd -P 2>/dev/null)" || cwd=""
+  if [[ -n "$cwd" && -w "$cwd" ]]; then
+    printf '%s' "$cwd"
+    return 0
+  fi
+  if [[ -d "$DEFAULT_WORKSPACE" ]]; then
+    cd "$DEFAULT_WORKSPACE" && pwd -P
+    return $?
+  fi
+  return 1
+}
+
+memory_field() {
+  local text="$1" key="$2" line val
+  local IFS=$'\n'
+  for line in ${(f)text}; do
+    if [[ "$line" == "${key}:"* ]]; then
+      val="${line#${key}: }"
+      val="${val#\"}"; val="${val%\"}"
+      val="${val#\'}"; val="${val%\'}"
+      if [[ -n "$val" ]]; then
+        printf '%s' "$val"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+priority_rank() {
+  case "$1" in critical) echo 0 ;; high) echo 1 ;; normal) echo 2 ;; low) echo 3 ;; *) echo 9 ;; esac
+}
+
+valid_type() {
+  case "$1" in decision|gotcha|convention|verification|handoff|note) return 0 ;; *) return 1 ;; esac
+}
+
+valid_priority() {
+  case "$1" in critical|high|normal|low) return 0 ;; *) return 1 ;; esac
+}
+
+valid_agent() {
+  case "$1" in claude|codex|user|shared) return 0 ;; *) return 1 ;; esac
+}
+
+summary_excerpt() {
+  local file="$1" content summary_start para line trimmed
+  content="$(<"$file")" || return 1
+  summary_start="${content##*$'\n## Summary'$'\n'}"
+  if [[ "$summary_start" != "$content" ]]; then
+    para="${summary_start%%$'\n'##*}"
+    local IFS=$'\n'
+    for line in ${(f)para}; do
+      trimmed="${line## }"
+      [[ -n "$trimmed" ]] && { printf '%s' "${trimmed:0:120}"; return 0; }
+    done
+  fi
+  return 0
+}
+
+# --- Main ---
+
+search_term=""
+filter_type=""
+filter_priority=""
+filter_tag=""
+filter_agent=""
+filter_id=""
+limit=10
+all_flag=0
+include_stale=0
+explicit_workspace=""
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --type)
+      if (( $# < 2 )); then echo "abg-recall: --type requires a value" >&2; exit 2; fi
+      filter_type="$2"; shift 2
+      ;;
+    --priority)
+      if (( $# < 2 )); then echo "abg-recall: --priority requires a value" >&2; exit 2; fi
+      filter_priority="$2"; shift 2
+      ;;
+    --tag)
+      if (( $# < 2 )); then echo "abg-recall: --tag requires a value" >&2; exit 2; fi
+      filter_tag="$2"; shift 2
+      ;;
+    --agent)
+      if (( $# < 2 )); then echo "abg-recall: --agent requires a value" >&2; exit 2; fi
+      filter_agent="$2"; shift 2
+      ;;
+    --id)
+      if (( $# < 2 )); then echo "abg-recall: --id requires a value" >&2; exit 2; fi
+      filter_id="$2"; shift 2
+      ;;
+    --limit)
+      if (( $# < 2 )); then echo "abg-recall: --limit requires a number" >&2; exit 2; fi
+      limit="$2"; shift 2
+      ;;
+    --all)
+      all_flag=1
+      shift
+      ;;
+    --include-stale)
+      include_stale=1
+      shift
+      ;;
+    --workspace)
+      if (( $# < 2 )); then echo "abg-recall: --workspace requires a path" >&2; exit 2; fi
+      explicit_workspace="$2"; shift 2
+      ;;
+    -*)
+      echo "abg-recall: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n "$search_term" ]]; then
+        search_term="$search_term $1"
+      else
+        search_term="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -n "$filter_type" ]]; then
+  valid_type "$filter_type" || { echo "abg-recall: invalid type '$filter_type' (expected: decision|gotcha|convention|verification|handoff|note)" >&2; exit 2; }
+fi
+if [[ -n "$filter_priority" ]]; then
+  valid_priority "$filter_priority" || { echo "abg-recall: invalid priority '$filter_priority' (expected: critical|high|normal|low)" >&2; exit 2; }
+fi
+if [[ -n "$filter_agent" ]]; then
+  valid_agent "$filter_agent" || { echo "abg-recall: invalid agent '$filter_agent'" >&2; exit 2; }
+fi
+if [[ "$limit" != <-> ]] || (( limit < 1 )); then
+  echo "abg-recall: --limit must be a positive integer" >&2
+  exit 2
+fi
+
+workspace="$(resolve_workspace "$explicit_workspace")" || {
+  echo "abg-recall: cannot resolve workspace" >&2
+  exit 1
+}
+
+memory_dir="$workspace/memory"
+if [[ ! -d "$memory_dir" ]]; then
+  echo "No matches"
+  exit 0
+fi
+
+RS=$'\x1f'
+
+# Collect all .md files
+local -a files=()
+local dir f
+for dir in claude codex shared; do
+  [[ -d "$memory_dir/$dir" ]] || continue
+  for f in "$memory_dir/$dir"/**/*.md(N); do
+    case "$f" in
+      */MEMORY.md|*/resume.md|*/README.md) continue ;;
+      */.resume.md.tmp.*) continue ;;
+    esac
+    files+=("$f")
+  done
+done
+
+# Parse and filter
+local -a results=()
+local f_entry content first_line rest frontmatter
+local id title type st priority visibility agent tags_val updated
+local pr summary_text found
+
+for f_entry in "${files[@]}"; do
+  content="$(<"$f_entry")" || continue
+  first_line="${content%%$'\n'*}"
+  [[ "$first_line" == "---" ]] || continue
+  rest="${content#*$'\n'}"
+  frontmatter="${rest%%$'\n---'*}"
+  [[ "$frontmatter" != "$rest" ]] || continue
+
+  id="$(memory_field "$frontmatter" "id")" || id=""
+  title="$(memory_field "$frontmatter" "title")" || title=""
+  type="$(memory_field "$frontmatter" "type")" || type=""
+  st="$(memory_field "$frontmatter" "status")" || st=""
+  priority="$(memory_field "$frontmatter" "priority")" || priority=""
+  visibility="$(memory_field "$frontmatter" "visibility")" || visibility=""
+  agent="$(memory_field "$frontmatter" "agent")" || agent=""
+  updated="$(memory_field "$frontmatter" "updated")" || updated=""
+  tags_val="$(memory_field "$frontmatter" "tags")" || tags_val=""
+
+  # Require minimum fields
+  [[ -z "$id" || -z "$type" ]] && continue
+
+  # Defaults
+  [[ -z "$st" ]] && st="stale"
+  [[ -z "$priority" ]] && priority="normal"
+  [[ -z "$visibility" ]] && visibility="shared"
+
+  # Status filter
+  if (( ! include_stale )) && [[ "$st" != "active" ]]; then
+    continue
+  fi
+
+  # Type filter
+  [[ -n "$filter_type" && "$type" != "$filter_type" ]] && continue
+
+  # Priority filter
+  [[ -n "$filter_priority" && "$priority" != "$filter_priority" ]] && continue
+
+  # Agent filter
+  [[ -n "$filter_agent" && "$agent" != "$filter_agent" ]] && continue
+
+  # ID filter
+  if [[ -n "$filter_id" ]]; then
+    case "$id" in
+      *"$filter_id"*) ;; *) continue ;;
+    esac
+  fi
+
+  # Tag filter
+  if [[ -n "$filter_tag" ]]; then
+    case "$tags_val" in
+      *"$filter_tag"*) ;; *) continue ;;
+    esac
+  fi
+
+  # Search term
+  if [[ -n "$search_term" ]]; then
+    found=0
+    case "$title" in
+      *"$search_term"*) found=1 ;;
+    esac
+    if (( ! found )); then
+      summary_text="$(summary_excerpt "$f_entry")" || summary_text=""
+      case "$summary_text" in
+        *"$search_term"*) found=1 ;;
+      esac
+    fi
+    if (( ! found )); then
+      case "$id" in
+        *"$search_term"*) found=1 ;;
+      esac
+    fi
+    (( found )) || continue
+  fi
+
+  pr="$(priority_rank "$priority")"
+  summary_text="$(summary_excerpt "$f_entry")" || summary_text=""
+  results+=("${pr}${RS}${updated}${RS}${priority}${RS}${id}${RS}${title}${RS}${type}${RS}${f_entry}${RS}${summary_text}")
+done
+
+if (( ${#results[@]} == 0 )); then
+  echo "No matches"
+  exit 0
+fi
+
+# Sort by priority rank asc, then id desc
+local sorted
+sorted="$(printf '%s\n' "${results[@]}" | sort -t $'\x1f' -k1,1n -k4,4r)" || sorted=""
+
+# Apply limit
+if (( all_flag )); then
+  limit=${#results[@]}
+fi
+
+local count=0 line
+local -a sorted_lines=()
+while IFS= read -r line; do
+  sorted_lines+=("$line")
+done <<< "$sorted"
+for line in "${sorted_lines[@]}"; do
+  ((++count))
+  (( count > limit )) && break
+  local -a parts=("${(@ps:\x1f:)line}")
+  local p_path="${parts[7]}"
+  local p_id="${parts[4]}"
+  local p_title="${parts[5]}"
+  local p_type="${parts[6]}"
+  local p_priority="${parts[3]}"
+  local p_summary="${parts[8]}"
+  local rel_path="${p_path#$workspace/}"
+
+  printf '%d. %s\n' "$count" "$p_title"
+  printf '   id: %s\n' "$p_id"
+  printf '   type: %s | priority: %s\n' "$p_type" "$p_priority"
+  printf '   path: %s\n' "$rel_path"
+  printf '   summary: %s\n' "$p_summary"
+done
