@@ -496,21 +496,28 @@ abg-open . --pair experiment --new-codex
 
 ```
 cocowork-tools/
-├── bin/
+├── bin/                  # CLI 工具
 │   ├── abg-open          # 启动协作环境
 │   ├── abg-upgrade       # 版本检查与升级
 │   ├── abg-remember      # 写入记忆
 │   └── abg-recall        # 搜索记忆
+├── workspace/            # 默认 workspace 模板
+│   ├── CLAUDE.md
+│   ├── AGENTS.md
+│   ├── memory/           # 共享记忆目录（空模板）
+│   └── .gitignore
 ├── install.sh            # 安装脚本
 └── README.md             # 本文件
 ```
 
----
+### 目录说明
 
-## 与 `cocowrok` 仓库的关系
+- `bin/` — CLI 工具，`install.sh` 复制到 `/opt/homebrew/bin/`
+- `workspace/` — 默认协作模板，首次安装时复制到 `~/.config/cocowork/workspace`。实际项目请用 `abg-open /path/to/project`，不需要手动复制
 
-- **[cocowork-tools](https://github.com/Nyarlathoteppppp/cocowork-tools)** — 本仓库，CLI 工具链
-- **[cocowrok](https://github.com/Nyarlathoteppppp/cocowrok)** — 默认 workspace 配置、共享记忆数据和协作协议文档
+### 历史仓库
+
+**`Nyarlathoteppppp/cocowrok` 已弃用并归档。** 原 workspace 配置已合并到本仓库的 `workspace/` 目录。所有功能通过本仓库提供。
 
 两个仓库独立。工具链是可分发的，workspace 是个人化的。
 
